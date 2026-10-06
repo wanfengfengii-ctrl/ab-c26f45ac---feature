@@ -4,7 +4,7 @@ import copy
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, HEALTH_PATH
 
 client = TestClient(app)
 AUDIT = "/api/trajectories/audit"
@@ -30,7 +30,7 @@ def base_payload():
 
 class TestHealth:
     def test_health_endpoint(self):
-        resp = client.get("/api/health")
+        resp = client.get(HEALTH_PATH)
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 

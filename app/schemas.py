@@ -92,6 +92,15 @@ class AuditRequest(BaseModel):
     segments: List[Segment] = Field(min_length=1, max_length=200)
 
 
+class RetimeRequest(AuditRequest):
+    """/retime reuses the exact ``joints`` / ``segments`` contract of /audit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_duration: PositiveDecimal
+    max_scale: Annotated[int, Field(strict=True, ge=1, le=1_000_000)]
+
+
 class JointPeak(BaseModel):
     joint_index: int
     joint: str
@@ -114,3 +123,23 @@ class AuditResponse(BaseModel):
     approved: bool
     joints: List[JointPeak]
     violations: List[Violation]
+
+
+class SegmentTiming(BaseModel):
+    segment_index: int
+    duration: str  # exact new duration (a positive whole multiple of cycle_duration)
+    cycles: int
+
+
+class RetimeResponse(BaseModel):
+    scale: int
+    cycle_duration: str
+    segments: List[SegmentTiming]
+    joints: List[JointPeak]  # exact peaks of the retimed trajectory
+
+
+class RetimeConflict(BaseModel):
+    """409 body: a stable machine-readable reason code plus a human message."""
+
+    reason: str  # "travel_out_of_bounds" | "zero_limit_with_motion" | "scale_exceeds_max"
+    msg: str

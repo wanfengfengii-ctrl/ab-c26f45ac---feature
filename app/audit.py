@@ -193,8 +193,25 @@ def _check_continuity(
         raise AuditInputError(errors)
 
 
-def run_audit(req: AuditRequest) -> AuditResponse:
-    """Validate continuity, then adjudicate the whole continuous trajectory."""
+def prepare_trajectory(
+    req: AuditRequest,
+) -> Tuple[
+    List[Fraction],
+    List[Dict[str, List[Fraction]]],
+    List[Tuple[Fraction, Fraction, Fraction, Fraction]],
+]:
+    """Validate structure/continuity and return exact rational geometry.
+
+    Returns ``(durations, positions, limits)``:
+
+    * ``durations[s]``     — segment duration as a ``Fraction``;
+    * ``positions[s][jid]`` — the four exact control points of segment ``s``;
+    * ``limits[j]``         — ``(travel_low, travel_high, velocity_limit,
+      acceleration_limit)`` for joint ``j``.
+
+    Raises ``AuditInputError`` (HTTP 422) on any structural or continuity
+    defect. Both /audit and /retime adjudicate the exact same geometry.
+    """
     _check_structure(req)
 
     durations = [to_fraction(seg.duration) for seg in req.segments]
@@ -207,6 +224,44 @@ def run_audit(req: AuditRequest) -> AuditResponse:
     ]
     _check_continuity(req, durations, positions)
 
+    limits = [
+        (
+            to_fraction(joint.travel.min),
+            to_fraction(joint.travel.max),
+            to_fraction(joint.velocity_limit),
+            to_fraction(joint.acceleration_limit),
+        )
+        for joint in req.joints
+    ]
+    return durations, positions, limits
+
+
+def travel_violations(
+    cps: List[Fraction], low: Fraction, high: Fraction
+) -> List[Tuple[str, Fraction, int]]:
+    """Return ``(bound, value, control_point_index)`` for each crossed bound.
+
+    Travel is the closed interval ``[low, high]``: a control point equal to
+    either bound is admissible. At most one entry per bound; the "worst"
+    point is reported (most negative for ``lower``, most positive for
+    ``upper``, smallest index breaking ties).
+    """
+    out: List[Tuple[str, Fraction, int]] = []
+    below = [i for i, c in enumerate(cps) if c < low]
+    if below:
+        worst = min(below, key=lambda i: (cps[i], i))
+        out.append(("lower", cps[worst], worst))
+    above = [i for i, c in enumerate(cps) if c > high]
+    if above:
+        worst = max(above, key=lambda i: (cps[i], -i))
+        out.append(("upper", cps[worst], worst))
+    return out
+
+
+def run_audit(req: AuditRequest) -> AuditResponse:
+    """Validate continuity, then adjudicate the whole continuous trajectory."""
+    durations, positions, limits = prepare_trajectory(req)
+
     violations: List[Violation] = []
     peak_velocity = [Fraction(0)] * len(req.joints)
     peak_acceleration = [Fraction(0)] * len(req.joints)
@@ -216,38 +271,19 @@ def run_audit(req: AuditRequest) -> AuditResponse:
         for joint_index, joint in enumerate(req.joints):
             jid = joint.id
             cps = positions[seg_index][jid]
-            low = to_fraction(joint.travel.min)
-            high = to_fraction(joint.travel.max)
+            low, high, v_limit, a_limit = limits[joint_index]
 
-            # Travel is a closed interval: equal to a bound is acceptable.
-            below = [i for i, c in enumerate(cps) if c < low]
-            if below:
-                worst = min(below, key=lambda i: (cps[i], i))
+            for bound, value, point_index in travel_violations(cps, low, high):
                 violations.append(
                     Violation(
                         segment_index=seg_index,
                         joint_index=joint_index,
                         joint=jid,
                         constraint="travel",
-                        bound="lower",
-                        control_point_index=worst,
-                        limit=format_exact(low),
-                        value=format_exact(cps[worst]),
-                    )
-                )
-            above = [i for i, c in enumerate(cps) if c > high]
-            if above:
-                worst = max(above, key=lambda i: (cps[i], -i))
-                violations.append(
-                    Violation(
-                        segment_index=seg_index,
-                        joint_index=joint_index,
-                        joint=jid,
-                        constraint="travel",
-                        bound="upper",
-                        control_point_index=worst,
-                        limit=format_exact(high),
-                        value=format_exact(cps[worst]),
+                        bound=bound,
+                        control_point_index=point_index,
+                        limit=format_exact(low if bound == "lower" else high),
+                        value=format_exact(value),
                     )
                 )
 
@@ -258,8 +294,6 @@ def run_audit(req: AuditRequest) -> AuditResponse:
                 peak_acceleration[joint_index] = seg_peak_a
 
             # Strictly greater than the limit violates; equal passes.
-            v_limit = to_fraction(joint.velocity_limit)
-            a_limit = to_fraction(joint.acceleration_limit)
             if seg_peak_v > v_limit:
                 violations.append(
                     Violation(
