@@ -54,6 +54,25 @@ NonNegativeDecimal = Annotated[Decimal, BeforeValidator(parse_decimal), Field(ge
 ControlPositions = Annotated[List[ExactDecimal], Field(min_length=4, max_length=4)]
 
 
+def parse_int(value: object) -> int:
+    """Parse a JSON value into an ``int``, rejecting booleans outright."""
+    if isinstance(value, bool):
+        raise ValueError("expected an integer, not a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+    raise ValueError(f"expected an integer, got {value!r}")
+
+
+# Uniform scale factor accepted by the retime endpoint: 1 .. 1_000_000.
+ScaleFactor = Annotated[int, BeforeValidator(parse_int), Field(ge=1, le=1_000_000)]
+
+
 class Travel(BaseModel):
     """Closed stroke interval [min, max] for one joint."""
 
@@ -85,11 +104,28 @@ class Segment(BaseModel):
     control_positions: Dict[str, ControlPositions] = Field(min_length=1)
 
 
-class AuditRequest(BaseModel):
+class TrajectoryRequest(BaseModel):
+    """Fields shared by every trajectory endpoint."""
+
     model_config = ConfigDict(extra="forbid")
 
     joints: List[JointSpec] = Field(min_length=1, max_length=8)
     segments: List[Segment] = Field(min_length=1, max_length=200)
+
+
+class AuditRequest(TrajectoryRequest):
+    pass
+
+
+class RetimeRequest(TrajectoryRequest):
+    """Audit fields plus the integer-cycle retiming parameters.
+
+    ``cycle_duration`` is the controller's cycle period (positive decimal);
+    ``max_scale`` bounds the uniform integer slowdown factor.
+    """
+
+    cycle_duration: PositiveDecimal
+    max_scale: ScaleFactor
 
 
 class JointPeak(BaseModel):
@@ -114,3 +150,37 @@ class AuditResponse(BaseModel):
     approved: bool
     joints: List[JointPeak]
     violations: List[Violation]
+
+
+class RetimeSegmentPlan(BaseModel):
+    """One retimed segment: exact new duration and its integer cycle count."""
+
+    segment_index: int
+    duration: str  # exact new segment duration (decimal or reduced fraction)
+    cycles: int  # duration / cycle_duration — a positive integer by construction
+
+
+class RetimeProof(BaseModel):
+    """Certificate that the returned scale is the smallest qualifying one.
+
+    A positive integer scale qualifies iff it is a multiple of
+    ``cycle_multiple`` (so every retimed segment lasts a whole number of
+    control cycles) and is at least ``limit_min_scale`` (so every joint's
+    retimed velocity and acceleration peaks stay within their limits). The
+    returned scale is the least such integer, so no smaller positive integer
+    scale qualifies.
+    """
+
+    cycle_multiple: int
+    limit_min_scale: int
+    minimal: bool
+
+
+class RetimeResponse(BaseModel):
+    scale: int
+    cycle_duration: str  # normalized exact echo of the request cycle period
+    segments: List[RetimeSegmentPlan]
+    total_duration: str
+    total_cycles: int
+    joints: List[JointPeak]  # peaks of the retimed (slowed) trajectory
+    proof: RetimeProof

@@ -24,7 +24,14 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Dict, List, Tuple
 
-from .schemas import AuditRequest, AuditResponse, JointPeak, Violation
+from .schemas import (
+    AuditRequest,
+    AuditResponse,
+    JointPeak,
+    JointSpec,
+    TrajectoryRequest,
+    Violation,
+)
 
 # Stable constraint ordering for violations: travel, then velocity, then
 # acceleration (the order the limits are stated in the API contract).
@@ -105,7 +112,7 @@ def segment_peaks(control: List[Fraction], duration: Fraction) -> Tuple[Fraction
     return peak_velocity, peak_acceleration
 
 
-def _check_structure(req: AuditRequest) -> None:
+def _check_structure(req: TrajectoryRequest) -> None:
     """Duplicate joint ids and per-segment joint coverage."""
     errors: List[dict] = []
     seen: Dict[str, int] = {}
@@ -145,7 +152,7 @@ def _check_structure(req: AuditRequest) -> None:
 
 
 def _check_continuity(
-    req: AuditRequest,
+    req: TrajectoryRequest,
     durations: List[Fraction],
     positions: List[Dict[str, List[Fraction]]],
 ) -> None:
@@ -193,6 +200,54 @@ def _check_continuity(
         raise AuditInputError(errors)
 
 
+def travel_violations(
+    seg_index: int,
+    joint_index: int,
+    joint: JointSpec,
+    cps: List[Fraction],
+) -> List[Violation]:
+    """Travel-limit violations of one joint's control positions in one segment.
+
+    Travel is a closed interval: equal to a bound is acceptable. Because a
+    Bézier curve stays inside the convex hull of its control points, control
+    positions inside the interval also keep the whole continuous curve inside.
+    """
+    found: List[Violation] = []
+    low = to_fraction(joint.travel.min)
+    high = to_fraction(joint.travel.max)
+    below = [i for i, c in enumerate(cps) if c < low]
+    if below:
+        worst = min(below, key=lambda i: (cps[i], i))
+        found.append(
+            Violation(
+                segment_index=seg_index,
+                joint_index=joint_index,
+                joint=joint.id,
+                constraint="travel",
+                bound="lower",
+                control_point_index=worst,
+                limit=format_exact(low),
+                value=format_exact(cps[worst]),
+            )
+        )
+    above = [i for i, c in enumerate(cps) if c > high]
+    if above:
+        worst = max(above, key=lambda i: (cps[i], -i))
+        found.append(
+            Violation(
+                segment_index=seg_index,
+                joint_index=joint_index,
+                joint=joint.id,
+                constraint="travel",
+                bound="upper",
+                control_point_index=worst,
+                limit=format_exact(high),
+                value=format_exact(cps[worst]),
+            )
+        )
+    return found
+
+
 def run_audit(req: AuditRequest) -> AuditResponse:
     """Validate continuity, then adjudicate the whole continuous trajectory."""
     _check_structure(req)
@@ -216,40 +271,7 @@ def run_audit(req: AuditRequest) -> AuditResponse:
         for joint_index, joint in enumerate(req.joints):
             jid = joint.id
             cps = positions[seg_index][jid]
-            low = to_fraction(joint.travel.min)
-            high = to_fraction(joint.travel.max)
-
-            # Travel is a closed interval: equal to a bound is acceptable.
-            below = [i for i, c in enumerate(cps) if c < low]
-            if below:
-                worst = min(below, key=lambda i: (cps[i], i))
-                violations.append(
-                    Violation(
-                        segment_index=seg_index,
-                        joint_index=joint_index,
-                        joint=jid,
-                        constraint="travel",
-                        bound="lower",
-                        control_point_index=worst,
-                        limit=format_exact(low),
-                        value=format_exact(cps[worst]),
-                    )
-                )
-            above = [i for i, c in enumerate(cps) if c > high]
-            if above:
-                worst = max(above, key=lambda i: (cps[i], -i))
-                violations.append(
-                    Violation(
-                        segment_index=seg_index,
-                        joint_index=joint_index,
-                        joint=jid,
-                        constraint="travel",
-                        bound="upper",
-                        control_point_index=worst,
-                        limit=format_exact(high),
-                        value=format_exact(cps[worst]),
-                    )
-                )
+            violations.extend(travel_violations(seg_index, joint_index, joint, cps))
 
             seg_peak_v, seg_peak_a = segment_peaks(cps, duration)
             if seg_peak_v > peak_velocity[joint_index]:

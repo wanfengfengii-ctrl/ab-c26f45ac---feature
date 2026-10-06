@@ -6,6 +6,9 @@ Waits for the API to become healthy, then runs, in order:
 2. build checks (byte-compile, application import, OpenAPI generation),
 3. API smoke tests over HTTP against the live service — an approvable
    trajectory, a limit-violating trajectory, decimal-equivalence invariance
+   and 422 behaviour,
+4. retime smoke tests over HTTP — minimal-scale retiming, exact integer
+   cycle counts, decimal-equivalence invariance, 409 conflict reason codes
    and 422 behaviour.
 
 Exits 0 only if every check passes; otherwise exits 1.
@@ -25,6 +28,7 @@ from typing import Callable, List, Tuple
 BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 HEALTH_PATH = os.environ.get("API_HEALTH_PATH", "/api/health")
 AUDIT_PATH = "/api/trajectories/audit"
+RETIME_PATH = "/api/trajectories/retime"
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEALTH_TIMEOUT = float(os.environ.get("VERIFY_HEALTH_TIMEOUT", "90"))
 
@@ -127,6 +131,57 @@ BAD_DURATION_PAYLOAD = {
 }
 
 
+def _retime_payload(**overrides):
+    """The passing trajectory plus retiming parameters.
+
+    Cycle 0.2 makes 0.5 s segments land on 5/2 cycles, so only even scales
+    keep whole cycles; the limits are already satisfied at scale 1, hence the
+    smallest qualifying scale is exactly 2.
+    """
+    payload = json.loads(json.dumps(PASSING_PAYLOAD))
+    payload["cycle_duration"] = "0.2"
+    payload["max_scale"] = 1000
+    payload.update(overrides)
+    return payload
+
+
+# Same retime request in decimal-equivalent spellings: identical results.
+RETIME_VARIANTS = [
+    _retime_payload(),
+    _retime_payload(
+        joints=[
+            {
+                "id": "j1",
+                "travel": {"min": "-2.0", "max": "2.00"},
+                "velocity_limit": "3.0",
+                "acceleration_limit": "20.00",
+            }
+        ],
+        segments=[
+            {"duration": "0.50", "control_positions": {"j1": ["0.0", "0.20", "0.60", "1.00"]}},
+            {"duration": "0.500", "control_positions": {"j1": ["1.000", "1.40", "1.60", "1.600"]}},
+        ],
+        cycle_duration="0.20",
+        max_scale="1000",
+    ),
+    _retime_payload(
+        joints=[
+            {
+                "id": "j1",
+                "travel": {"min": "-2E0", "max": "2e0"},
+                "velocity_limit": "30E-1",
+                "acceleration_limit": "2E1",
+            }
+        ],
+        segments=[
+            {"duration": "5E-1", "control_positions": {"j1": ["0E0", "2E-1", "6E-1", "1"]}},
+            {"duration": "500E-3", "control_positions": {"j1": ["1.0", "14E-1", "16E-1", "1.6"]}},
+        ],
+        cycle_duration="2E-1",
+    ),
+]
+
+
 def wait_for_health() -> None:
     url = BASE_URL + HEALTH_PATH
     deadline = time.monotonic() + HEALTH_TIMEOUT
@@ -178,7 +233,8 @@ def run_build_checks() -> None:
             "-c",
             "from app.main import app\n"
             "schema = app.openapi()\n"
-            "assert '/api/trajectories/audit' in schema['paths']\n",
+            "assert '/api/trajectories/audit' in schema['paths']\n"
+            "assert '/api/trajectories/retime' in schema['paths']\n",
         ],
         cwd=APP_DIR,
     )
@@ -235,6 +291,96 @@ def smoke_unprocessable() -> None:
     assert isinstance(body.get("detail"), list) and body["detail"], body
 
 
+def smoke_retime_approved() -> None:
+    status, body = http_post(RETIME_PATH, _retime_payload())
+    assert status == 200, f"expected 200, got {status}: {body}"
+    # Only even scales land 0.5 s segments on whole 0.2 s cycles -> scale 2.
+    assert body["scale"] == 2, body
+    assert [s["duration"] for s in body["segments"]] == ["1", "1"], body
+    assert [s["cycles"] for s in body["segments"]] == [5, 5], body
+    assert body["total_duration"] == "2" and body["total_cycles"] == 10, body
+    peaks = body["joints"][0]
+    assert peaks["peak_velocity"] == "1.2", peaks  # 2.4 / 2
+    assert peaks["peak_acceleration"] == "1.2", peaks  # 4.8 / 2**2
+    # Minimality certificate: feasible scales are multiples of cycle_multiple
+    # that are >= limit_min_scale; the returned scale is the least of them.
+    proof = body["proof"]
+    assert proof["cycle_multiple"] == 2 and proof["limit_min_scale"] == 1, proof
+    assert proof["minimal"] is True, proof
+    assert body["scale"] - proof["cycle_multiple"] < proof["limit_min_scale"], body
+
+
+def smoke_retime_limit_driven() -> None:
+    # Velocity limit 1 forces k >= ceil(2.4 / 1) = 3; durations already on
+    # whole 0.5 s cycles, so the limit alone drives the scale.
+    payload = _retime_payload(cycle_duration="0.5")
+    payload["joints"][0]["velocity_limit"] = "1"
+    status, body = http_post(RETIME_PATH, payload)
+    assert status == 200, f"expected 200, got {status}: {body}"
+    assert body["scale"] == 3, body
+    assert [s["cycles"] for s in body["segments"]] == [3, 3], body
+    peaks = body["joints"][0]
+    assert peaks["peak_velocity"] == "0.8", peaks  # 2.4 / 3
+    assert peaks["peak_acceleration"] == "8/15", peaks  # 4.8 / 9, exact
+    assert body["proof"] == {"cycle_multiple": 1, "limit_min_scale": 3, "minimal": True}
+
+
+def smoke_retime_decimal_equivalence() -> None:
+    bodies = []
+    for variant in RETIME_VARIANTS:
+        status, body = http_post(RETIME_PATH, variant)
+        assert status == 200, f"expected 200, got {status}: {body}"
+        bodies.append(body)
+    for i, body in enumerate(bodies[1:], start=1):
+        assert body == bodies[0], (
+            f"decimal-equivalent retime variant {i} changed the result:\n"
+            f"{json.dumps(bodies[0], sort_keys=True)}\nvs\n{json.dumps(body, sort_keys=True)}"
+        )
+
+
+def smoke_retime_conflicts() -> None:
+    # Travel violations cannot be fixed by slowing down.
+    payload = _retime_payload()
+    payload["segments"][0]["control_positions"]["j1"][1] = "5"
+    status, body = http_post(RETIME_PATH, payload)
+    assert status == 409, f"expected 409, got {status}: {body}"
+    assert body["detail"]["reason"] == "travel_out_of_bounds", body
+
+    # A non-zero peak can never meet a zero limit.
+    for field, reason in (
+        ("velocity_limit", "zero_velocity_limit"),
+        ("acceleration_limit", "zero_acceleration_limit"),
+    ):
+        payload = _retime_payload()
+        payload["joints"][0][field] = "0"
+        status, body = http_post(RETIME_PATH, payload)
+        assert status == 409, f"expected 409, got {status}: {body}"
+        assert body["detail"]["reason"] == reason, body
+
+    # The smallest qualifying scale (2) exceeds max_scale (1).
+    status, body = http_post(RETIME_PATH, _retime_payload(max_scale=1))
+    assert status == 409, f"expected 409, got {status}: {body}"
+    detail = body["detail"]
+    assert detail["reason"] == "scale_exceeds_max", body
+    assert detail["required_scale"] == "2" and detail["max_scale"] == 1, body
+
+
+def smoke_retime_unprocessable() -> None:
+    # Non-positive control cycle.
+    status, body = http_post(RETIME_PATH, _retime_payload(cycle_duration="0"))
+    assert status == 422, f"expected 422 for zero cycle, got {status}: {body}"
+    # Out-of-range max_scale.
+    for bad in (0, 1000001):
+        status, body = http_post(RETIME_PATH, _retime_payload(max_scale=bad))
+        assert status == 422, f"expected 422 for max_scale={bad}, got {status}: {body}"
+    # Continuity errors stay 422 on the retime endpoint too.
+    payload = _retime_payload()
+    payload["segments"][1]["control_positions"]["j1"][0] = "1.0001"
+    status, body = http_post(RETIME_PATH, payload)
+    assert status == 422, f"expected 422 for discontinuity, got {status}: {body}"
+    assert any(e["type"] == "continuity.position" for e in body["detail"]), body
+
+
 def main() -> int:
     checks: List[Tuple[str, Callable[[], None]]] = [
         ("code tests (pytest)", run_unit_tests),
@@ -243,6 +389,11 @@ def main() -> int:
         ("API smoke: limit-violating trajectory", smoke_violating),
         ("API smoke: decimal-equivalence invariance", smoke_decimal_equivalence),
         ("API smoke: 422 for discontinuity / non-positive duration", smoke_unprocessable),
+        ("API smoke: retime minimal scale and exact cycles", smoke_retime_approved),
+        ("API smoke: retime driven by velocity limit", smoke_retime_limit_driven),
+        ("API smoke: retime decimal-equivalence invariance", smoke_retime_decimal_equivalence),
+        ("API smoke: retime 409 conflict reason codes", smoke_retime_conflicts),
+        ("API smoke: retime 422 for bad cycle / max_scale / continuity", smoke_retime_unprocessable),
     ]
 
     print(f"verify: waiting for API health at {BASE_URL}{HEALTH_PATH}")
