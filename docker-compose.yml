@@ -1,0 +1,36 @@
+# Robot trajectory audit stack.
+#
+# Configuration (all optional, via environment or .env):
+#   API_HOST_PORT   host port the API is published on      (default 8080)
+#   APP_PORT        container port the API listens on      (default 8000)
+#   API_HEALTH_PATH health-check route served and probed   (default /api/health)
+#
+# Run the API:                 docker compose up --build api
+# Run the one-shot verifier:   docker compose up --build --exit-code-from verify
+services:
+  api:
+    build: .
+    image: trajectory-audit:latest
+    environment:
+      APP_PORT: ${APP_PORT:-8000}
+      API_HEALTH_PATH: ${API_HEALTH_PATH:-/api/health}
+    ports:
+      - "${API_HOST_PORT:-8080}:${APP_PORT:-8000}"
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  verify:
+    image: trajectory-audit:latest
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:${APP_PORT:-8000}
+      API_HEALTH_PATH: ${API_HEALTH_PATH:-/api/health}
+    command: ["python", "-m", "app.verify"]
+    restart: "no"
